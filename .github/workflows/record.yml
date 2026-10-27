@@ -1,0 +1,348 @@
+name: Record Twitch Stream (On-Demand)
+run-name: Record ${{ inputs.channel }}
+
+# Started automatically by the Cloudflare Worker when a channel goes live
+# (one run per live channel), or by hand from the Actions tab.
+# The run name "Record <channel>" is how the Worker tells channels apart. Do not change it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Twitch Channel Name'
+        required: true
+        default: 'vishislive'
+        type: string
+      max_minutes:
+        description: 'Max recording length per run in minutes (315 = 5h15m). A new run takes over automatically if he is still live.'
+        required: false
+        default: '315'
+        type: string
+      duration_hours:
+        description: 'Legacy input, ignored (kept so an older Worker version does not break). Use max_minutes.'
+        required: false
+        default: ''
+        type: string
+      quality:
+        description: 'Video Quality'
+        required: true
+        default: 'best'
+        type: choice
+        options:
+          - 'best'
+          - '1080p60'
+          - '720p60'
+          - '720p'
+          - '480p'
+      auto_finish:
+        description: 'Upload right after the stream ends (10-min reconnect grace period)'
+        required: true
+        default: true
+        type: boolean
+      drive_folder:
+        description: 'Google Drive folder under Twitch_Recordings (empty = channel name)'
+        required: false
+        default: ''
+        type: string
+      start_wait_min:
+        description: 'Minutes to wait for the stream to start (0 = whole run). Used by the automatic hand-off.'
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+  actions: write   # lets a run start the next run (hand-off) with the built-in token
+
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      IN_CHANNEL: ${{ inputs.channel }}
+      IN_MAX_MIN: ${{ inputs.max_minutes }}
+      IN_QUALITY: ${{ inputs.quality }}
+      IN_AUTO_FINISH: ${{ inputs.auto_finish }}
+      IN_DRIVE_FOLDER: ${{ inputs.drive_folder }}
+      IN_START_WAIT_MIN: ${{ inputs.start_wait_min }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Fast Install Streamlink
+        run: |
+          pip install -q --upgrade streamlink
+
+      - name: Monitor and Record Stream
+        continue-on-error: true
+        run: |
+          set +e
+          JOB_T0=$(date +%s)
+
+          CHANNEL="${IN_CHANNEL:-vishislive}"
+          QUALITY="${IN_QUALITY:-best}"
+          MAX_MIN="${IN_MAX_MIN:-315}"
+          AUTO_FINISH="${IN_AUTO_FINISH:-true}"
+          START_WAIT_MIN="${IN_START_WAIT_MIN:-0}"
+
+          # Basic input checks (channel is used in URLs, so keep it strictly safe)
+          if ! [[ "$CHANNEL" =~ ^[A-Za-z0-9_]{1,25}$ ]]; then echo "Invalid channel name: $CHANNEL"; exit 1; fi
+          case "$MAX_MIN" in ''|*[!0-9]*) MAX_MIN=315 ;; esac
+          case "$START_WAIT_MIN" in ''|*[!0-9]*) START_WAIT_MIN=0 ;; esac
+
+          DURATION_SEC=${DURATION_SEC_OVERRIDE:-$((MAX_MIN * 60))}   # override is for testing only
+          HANDOFF_LEAD_SEC=${HANDOFF_LEAD_SEC:-120}                  # start the next run this long before the limit
+          END_TIME=$(( JOB_T0 + DURATION_SEC ))
+          PART=1
+          HAS_RECORDED=false
+          : > stats.txt
+
+          # ---------------------------------------------------------------------------
+          # Background task #1 ("second terminal"): system info, light cleanup only if
+          # disk is low, and install the tools needed AFTER recording (ffmpeg, rclone).
+          # ---------------------------------------------------------------------------
+          (
+            echo "[setup] $(date -u +%T) runner image: ${ImageVersion:-unknown}, cpus: $(nproc), ram: $(free -m | awk '/Mem:/{print $2}') MB"
+            df -h / | sed 's/^/[setup] /'
+            FREE_GB=$(df -P -k / | awk 'NR==2{print int($4/1048576)}')
+            if [ "${FREE_GB:-0}" -lt 50 ]; then
+              echo "[setup] only ${FREE_GB} GB free (< 50): removing unused preinstalled software"
+              sudo ionice -c 3 rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/julia* /usr/lib/jvm
+              df -h / | sed 's/^/[setup] after cleanup: /'
+            fi
+            for t in ffmpeg jq curl rclone; do command -v "$t" >/dev/null 2>&1 || NEED="$NEED $t"; done
+            if [ -n "$NEED" ]; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq $NEED
+              echo "[setup] $(date -u +%T) installed:$NEED"
+            fi
+          ) >setup.log 2>&1 &
+          INSTALL_PID=$!
+
+          # ---------------------------------------------------------------------------
+          # Background task #2: hand-off. A little before this run's time limit, if the
+          # channel is still live, start the next run so recording continues with no gap.
+          # ---------------------------------------------------------------------------
+          handoff() {
+            local wait_s=$(( DURATION_SEC - HANDOFF_LEAD_SEC ))
+            [ "$wait_s" -gt 0 ] || return 0
+            sleep "$wait_s"
+            local q state wf body code
+            q='{"query":"query($login: String!) { user(login: $login) { stream { id type } } }","variables":{"login":"'"$(echo "$CHANNEL" | tr '[:upper:]' '[:lower:]')"'"}}'
+            state=$(curl -s --max-time 10 -H 'Client-Id: kimne78kx3ncx6brgo4mv6wki5h1ko' -H 'Content-Type: application/json' -d "$q" https://gql.twitch.tv/gql | jq -r '.data.user.stream.type // "offline"' 2>/dev/null)
+            if [ "$state" != "live" ]; then
+              echo "[handoff] $(date -u +%T) $CHANNEL is not live now: not starting a next run (the Worker will start one if he comes back)"
+              return 0
+            fi
+            wf=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+            body=$(jq -n --arg ref "${GITHUB_REF_NAME:-main}" --arg ch "$CHANNEL" --arg mm "$MAX_MIN" --arg ql "$QUALITY" --arg af "$AUTO_FINISH" --arg df "${IN_DRIVE_FOLDER:-}" \
+              '{ref:$ref, inputs: ({channel:$ch, max_minutes:$mm, quality:$ql, auto_finish:$af, start_wait_min:"10"} + (if $df != "" then {drive_folder:$df} else {} end))}')
+            code=$(curl -s -o handoff.out -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/$wf/dispatches" -d "$body")
+            if [ "$code" = "204" ]; then
+              echo "[handoff] $(date -u +%T) next run started for $CHANNEL (overlap, so nothing is missed)"
+            else
+              echo "[handoff] $(date -u +%T) FAILED (HTTP $code): $(cat handoff.out 2>/dev/null). The Worker will start a new run after this one finishes."
+            fi
+          }
+          handoff &
+          HANDOFF_PID=$!
+
+          echo "Starting recorder for twitch.tv/$CHANNEL"
+          echo "Limit: ${MAX_MIN} min (${DURATION_SEC}s) | Quality: $QUALITY | Auto-finish: $AUTO_FINISH | Start-wait: ${START_WAIT_MIN} min"
+
+          # ---------------------------------------------------------------------------
+          # Recording loop
+          # ---------------------------------------------------------------------------
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            REMAINING=$(( END_TIME - $(date +%s) ))
+            if [ "$REMAINING" -le 60 ]; then
+              echo "Time limit reached (${REMAINING}s left). Finishing."
+              break
+            fi
+
+            TS_FILE="part_${PART}.ts"
+            MP4_FILE="part_${PART}.mp4"
+            LAUNCH=$(date +%s)
+
+            if [ "$HAS_RECORDED" = "true" ] && [ "$AUTO_FINISH" = "true" ]; then
+              echo "Stream dropped. Waiting up to 10 minutes for it to come back..."
+              # 15s x 40 retries = 600s (10 minutes)
+              timeout "${REMAINING}s" streamlink --retry-streams 15 --retry-max 40 --twitch-supported-codecs h264 "https://www.twitch.tv/$CHANNEL" "$QUALITY" -o "$TS_FILE" || true
+            else
+              WAIT_S=$REMAINING
+              if [ "$HAS_RECORDED" = "false" ] && [ "$START_WAIT_MIN" -gt 0 ]; then
+                WAIT_S=$(( START_WAIT_MIN * 60 )); [ "$WAIT_S" -gt "$REMAINING" ] && WAIT_S=$REMAINING
+              fi
+              echo "Waiting for $CHANNEL to go live (up to ${WAIT_S}s)..."
+              timeout "${WAIT_S}s" streamlink --retry-streams 5 --twitch-supported-codecs h264 "https://www.twitch.tv/$CHANNEL" "$QUALITY" -o "$TS_FILE" || true
+            fi
+
+            if [ -s "$TS_FILE" ]; then
+              HAS_RECORDED=true
+              # when did this part really start? (file creation time, else launch time)
+              B=$(stat -c %W "$TS_FILE" 2>/dev/null); [ "${B:-0}" -gt 0 ] || B=$LAUNCH
+              [ -f start_epoch.txt ] || echo "$B" > start_epoch.txt
+              echo "Part $PART recorded: $(du -h "$TS_FILE" | cut -f1)"
+
+              # conversion needs ffmpeg: if the background install is still running, wait for it
+              command -v ffmpeg >/dev/null 2>&1 || wait "$INSTALL_PID"
+
+              echo "Normalizing Part $PART for merging..."
+              C0=$(date +%s)
+              if ffmpeg -nostdin -loglevel error -y -i "$TS_FILE" -c copy "$MP4_FILE"; then
+                rm -f "$TS_FILE"
+                echo "file '$MP4_FILE'" >> mylist.txt
+              else
+                echo "Could not convert $TS_FILE now; it will be rescued in the upload step."
+              fi
+              echo "convert_part_${PART}_s=$(( $(date +%s) - C0 ))" >> stats.txt
+              PART=$((PART + 1))
+            else
+              if [ "$HAS_RECORDED" = "true" ] && [ "$AUTO_FINISH" = "true" ]; then
+                echo "Streamer did not come back within 10 minutes. Finishing and uploading now!"
+                break
+              fi
+              if [ "$HAS_RECORDED" = "false" ] && [ "$START_WAIT_MIN" -gt 0 ]; then
+                echo "Stream did not start within ${START_WAIT_MIN} minutes. Finishing."
+                break
+              fi
+            fi
+
+            sleep 10
+          done
+
+          # Stop the hand-off timer if it has not fired, and let the tool install finish
+          kill "$HANDOFF_PID" 2>/dev/null
+          wait "$INSTALL_PID" 2>/dev/null
+          echo "record_end_epoch=$(date +%s)" >> stats.txt
+          echo "----- background log -----"; cat setup.log 2>/dev/null
+          df -h / | sed 's/^/[disk after recording] /'
+
+      - name: Merge Parts and Upload to Cloud
+        if: always()
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          set +e
+
+          CHANNEL="${IN_CHANNEL:-vishislive}"
+          FOLDER="${IN_DRIVE_FOLDER:-$CHANNEL}"
+          FOLDER="${FOLDER//[^A-Za-z0-9_-]/_}"    # keep the Drive folder name safe
+
+          df -h / | sed 's/^/[disk before merge] /'
+
+          # Ensure post-processing tools are ready
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v rclone >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq curl rclone
+          fi
+
+          # Rescue any leftover .ts segment (manual cancel, or conversion failed earlier)
+          for TS_FILE in part_*.ts; do
+            if [ -s "$TS_FILE" ]; then
+              MP4_FILE="${TS_FILE%.ts}.mp4"
+              echo "Rescuing segment $TS_FILE..."
+              if ffmpeg -nostdin -loglevel error -y -i "$TS_FILE" -c copy "$MP4_FILE"; then
+                rm -f "$TS_FILE"
+                echo "file '$MP4_FILE'" >> mylist.txt
+              fi
+            fi
+          done
+
+          if [ -s "mylist.txt" ]; then
+            PART_COUNT=$(wc -l < mylist.txt)
+
+            # File name uses the time the recording STARTED (IST), so files sort in order
+            START=$(cat start_epoch.txt 2>/dev/null); [ -n "$START" ] || START=$(date +%s)
+            STAMP=$(TZ='Asia/Kolkata' date -d "@$START" +%Y-%m-%d_%H-%M-%S_IST)
+            FINAL_FILE="${CHANNEL}_${STAMP}.mp4"
+
+            M0=$(date +%s)
+            if [ "$PART_COUNT" -eq 1 ]; then
+              FIRST_PART=$(awk -F"'" '{print $2}' mylist.txt)
+              mv "$FIRST_PART" "$FINAL_FILE"
+            else
+              echo "Merging $PART_COUNT parts into a single continuous MP4..."
+              ffmpeg -nostdin -loglevel error -y -f concat -safe 0 -i mylist.txt -c copy "$FINAL_FILE"
+              rm -f part_*.mp4
+            fi
+            MERGE_SEC=$(( $(date +%s) - M0 ))
+            SIZE_BYTES=$(stat -c %s "$FINAL_FILE" 2>/dev/null || echo 0)
+            SIZE_GB=$(awk -v b="$SIZE_BYTES" 'BEGIN{printf "%.2f", b/1073741824}')
+            df -h / | sed 's/^/[disk after merge] /'
+
+            UPLOADED_TO="none"; UP_SEC=0; LINK=""
+            U0=$(date +%s)
+
+            # 1st priority: Google Drive via the RCLONE_CONFIG secret
+            if [ -n "$RCLONE_CONFIG_DATA" ]; then
+              mkdir -p ~/.config/rclone
+              printf '%s\n' "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+              RCLONE_REMOTE=$(rclone listremotes | head -n 1 | tr -d ':')
+              if [ -n "$RCLONE_REMOTE" ]; then
+                GDRIVE_FOLDER="Twitch_Recordings/${FOLDER}"
+                echo "Uploading to Google Drive: ${RCLONE_REMOTE}:${GDRIVE_FOLDER}..."
+                if rclone copy "$FINAL_FILE" "${RCLONE_REMOTE}:${GDRIVE_FOLDER}" --drive-chunk-size 64M --stats=15s -v; then
+                  UPLOADED_TO="Google Drive (${GDRIVE_FOLDER})"
+                  LINK=$(rclone link "${RCLONE_REMOTE}:${GDRIVE_FOLDER}/${FINAL_FILE}" 2>/dev/null || true)
+                else
+                  echo "Google Drive upload failed. Switching to Gofile failsafe..."
+                fi
+              else
+                echo "No remote found in RCLONE_CONFIG. Switching to Gofile failsafe..."
+              fi
+            else
+              echo "RCLONE_CONFIG secret is empty. Switching to Gofile failsafe..."
+            fi
+
+            # 2nd priority (failsafe): Gofile, then Litterbox
+            if [ "$UPLOADED_TO" = "none" ]; then
+              echo "Uploading to Gofile..."
+              GOFILE_SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // "store1"')
+              GOFILE_RESPONSE=$(curl -s -X POST "https://${GOFILE_SERVER}.gofile.io/contents/uploadfile" -F "file=@$FINAL_FILE")
+              GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+              if [ "$GOFILE_STATUS" != "ok" ]; then
+                GOFILE_RESPONSE=$(curl -s -X POST "https://upload.gofile.io/uploadfile" -F "file=@$FINAL_FILE")
+                GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+              fi
+              if [ "$GOFILE_STATUS" = "ok" ]; then
+                LINK=$(echo "$GOFILE_RESPONSE" | jq -r '.data.downloadPage')
+                UPLOADED_TO="Gofile"
+              else
+                echo "Gofile failed. Uploading to Litterbox (72h temporary host)..."
+                LITTER_LINK=$(curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$FINAL_FILE" https://litterbox.catbox.moe/resources/internals/api.php)
+                if [[ "$LITTER_LINK" == https* ]]; then LINK="$LITTER_LINK"; UPLOADED_TO="Litterbox (72h)"; fi
+              fi
+            fi
+            UP_SEC=$(( $(date +%s) - U0 ))
+            UP_MBPS=$(awk -v b="$SIZE_BYTES" -v s="$UP_SEC" 'BEGIN{ if (s>0) printf "%.1f", b/1048576/s; else print "n/a" }')
+
+            # Result block (log + run summary)
+            REC_SEC=$(( $(date +%s) - START ))
+            {
+              echo "=========================================="
+              if [ "$UPLOADED_TO" = "none" ]; then
+                echo "ALL UPLOADS FAILED for $FINAL_FILE"
+              else
+                echo "UPLOAD SUCCESSFUL: $UPLOADED_TO"
+                [ -n "$LINK" ] && echo "LINK: $LINK"
+              fi
+              echo "file: $FINAL_FILE | $SIZE_GB GB | $PART_COUNT part(s)"
+              echo "merge: ${MERGE_SEC}s | upload: ${UP_SEC}s (${UP_MBPS} MB/s) | recording started $STAMP, finished ~$((REC_SEC / 60)) min later"
+              echo "=========================================="
+            } | tee -a result.txt
+
+            {
+              echo "### $CHANNEL: $FINAL_FILE"
+              if [ "$UPLOADED_TO" = "none" ]; then
+                echo "❌ Recorded ($SIZE_GB GB) but **all cloud uploads failed**."
+              elif [ -n "$LINK" ]; then
+                echo "✅ [Uploaded to $UPLOADED_TO]($LINK) — $SIZE_GB GB, $PART_COUNT part(s) combined"
+              else
+                echo "✅ Uploaded to $UPLOADED_TO — $SIZE_GB GB, $PART_COUNT part(s) combined"
+              fi
+              echo
+              echo "- recording started: $STAMP"
+              echo "- merge: ${MERGE_SEC}s, upload: ${UP_SEC}s (${UP_MBPS} MB/s)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ❌ $CHANNEL never went live during this run." >> "$GITHUB_STEP_SUMMARY"
+          fi
